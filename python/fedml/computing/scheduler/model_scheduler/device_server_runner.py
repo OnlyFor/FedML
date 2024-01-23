@@ -118,6 +118,11 @@ class FedMLServerRunner:
         self.subscribed_topics = list()
         self.user_name = None
 
+        self.devices_need_update = list()
+        self.devices_updated = list()
+        self.curr_update_window = list()
+        self.max_unavailable_rate = 0.5
+
     def build_dynamic_constrain_variables(self, run_id, run_config):
         pass
 
@@ -346,7 +351,10 @@ class FedMLServerRunner:
         # Diff could be scale in
         self.send_deployment_delete_request_to_edges(payload=json.dumps(self.request_json), model_msg_object=None)
 
-        if len(should_added_devices) == 0:
+        if len(should_added_devices) == 0 and len(self.devices_need_update) == 0:
+            '''
+            If just delete workload, we do not need to wait for the slave devices to finish the delete.
+            '''
             ip = self.get_ip_address(self.request_json)
             master_port = os.getenv("FEDML_MASTER_PORT", None)
             if master_port is not None:
@@ -540,6 +548,8 @@ class FedMLServerRunner:
             self.slave_deployment_results_mapping[run_id_str] = dict()
         self.slave_deployment_results_mapping[run_id_str][str(device_id)] = model_status
 
+        logging.info(f"Debug Raphael 3-01-29 Received deployment result message from {device_id}")
+
         logging.info("callback_deployment_result_message: topic {}, payload {}, mapping {}.".format(
             topic, payload, self.slave_deployment_results_mapping[run_id_str]))
 
@@ -551,18 +561,55 @@ class FedMLServerRunner:
                 ServerConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_FAILED)
             return
 
-        # When all deployments are finished
         all_device_id_list = request_json["device_ids"]
 
         device_id_list = []
 
         for device in all_device_id_list:
+            if str(device) == str(self.edge_id):
+                continue
+                
             if device in request_json["diff_devices"] and \
                     (request_json["diff_devices"][device] == ServerConstants.DEVICE_DIFF_ADD_OPERATION or
                      request_json["diff_devices"][device] == ServerConstants.DEVICE_DIFF_REPLACE_OPERATION):
                 device_id_list.append(device)
 
-        if len(device_id_list) <= len(self.slave_deployment_results_mapping[run_id_str].keys()) + 1:
+        tmp = request_json["diff_devices"].get(device_id, "Not found")
+        logging.info(f"[Raphael Debug] device_id_list: {device_id_list}, device: {device_id} tmp: {tmp}")
+        logging.info(f"[Raphael Debug] type of device_id {type(device_id)}")
+
+        if request_json["diff_devices"].get(int(device_id), None) == ServerConstants.DEVICE_DIFF_REPLACE_OPERATION:
+            if model_status == ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_FAILED:
+                # TODO: Support rollback
+                return
+            else:
+                # Get record from the first message that Java mlops sent
+                total_device_objs_list = self.request_json["device_objs"]
+                device_obj_to_insert = None
+
+                for device_obj in total_device_objs_list:
+                    if device_obj["id"] == int(device_id):
+                        device_obj["status"] = ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_DEPLOYED
+                        device_obj_to_insert = device_obj
+                        break
+                if not device_obj_to_insert:
+                    raise Exception(f"Cannot find device {device_id} in the device list {total_device_objs_list}")
+                
+                FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
+                    add_end_point_device_info(request_json["end_point_id"], end_point_name,
+                                              json.dumps(device_obj_to_insert))
+
+                self.send_next_scroll_update_msg(int(device_id))
+
+        if len(self.slave_deployment_results_mapping[run_id_str].keys()) >= len(device_id_list):
+            '''
+            When all the devices have finished the add / update operation
+            '''
+            logging.info(f"Debug Raphael 2-01-29 Satisfy the condition")
+            logging.info(f"Debug Raphael 2-01-29 device_id_list: {device_id_list}, \
+                         self.slave_deployment_results_mapping[run_id_str].keys(): \
+                         {self.slave_deployment_results_mapping[run_id_str].keys()}")
+
             failed_to_deploy_all_models = False
             for device_item in device_id_list:
                 if device_item == self.edge_id: # Skip the master
@@ -661,6 +708,8 @@ class FedMLServerRunner:
             FedMLServerDataInterface.get_instance().save_job_result(end_point_id, self.edge_id,
                                                                     json.dumps(payload_json_saved))
 
+            self.slave_deployment_results_mapping[run_id_str] = dict()
+
             time.sleep(3)
             self.set_runner_completed_event(end_point_id)
 
@@ -697,8 +746,16 @@ class FedMLServerRunner:
                 ServerConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_FAILED)
             return
 
-        device_id_list = request_json["device_ids"]
-        if len(device_id_list) <= len(self.slave_deployment_statuses_mapping[run_id_str].keys()) + 1: # Recv all
+        device_id_list = []
+        for device in request_json["device_ids"]:
+            if str(device) == str(self.edge_id):
+                continue
+            if device in request_json["diff_devices"] and \
+                    (request_json["diff_devices"][device] == ServerConstants.DEVICE_DIFF_ADD_OPERATION or
+                     request_json["diff_devices"][device] == ServerConstants.DEVICE_DIFF_REPLACE_OPERATION):
+                device_id_list.append(device)
+
+        if len(self.slave_deployment_statuses_mapping[run_id_str].keys()) >= len(device_id_list):
             failed_to_deploy_all_models = False
             for device_item in device_id_list:
                 if device_item == self.edge_id: # Skip the master
@@ -746,6 +803,9 @@ class FedMLServerRunner:
                                         payload_json["model_name"],
                                         model_inference_url,
                                         ServerConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_DEPLOYED)
+            
+            # Clean the status in case next deployment
+            self.slave_deployment_statuses_mapping[run_id_str] = dict()
 
     def send_deployment_start_request_to_edges(self):
         run_id = self.request_json["run_id"]
@@ -753,8 +813,7 @@ class FedMLServerRunner:
         edge_id_list = []
         for device_id in self.request_json["device_ids"]:
             if device_id in self.request_json["diff_devices"] and \
-                    (self.request_json["diff_devices"][device_id] == ServerConstants.DEVICE_DIFF_ADD_OPERATION or
-                     self.request_json["diff_devices"][device_id] == ServerConstants.DEVICE_DIFF_REPLACE_OPERATION):
+                    (self.request_json["diff_devices"][device_id] == ServerConstants.DEVICE_DIFF_ADD_OPERATION):
                 edge_id_list.append(device_id)
 
         logging.info("Edge ids before diff: " + str(self.request_json["device_ids"]))
@@ -767,12 +826,15 @@ class FedMLServerRunner:
             if edge_id == self.edge_id:
                 continue
             should_added_devices.append(edge_id)
-            # send start deployment request to each model device
-            topic_start_deployment = "model_ops/model_device/start_deployment/{}".format(str(edge_id))
-            logging.info("start_deployment: send topic " + topic_start_deployment + " to client...")
-            self.client_mqtt_mgr.send_message_json(topic_start_deployment, json.dumps(self.request_json))
+            # send start deployment request to each device
+            self.send_deployment_start_request_to_edge(edge_id)
         return should_added_devices
 
+    def send_deployment_start_request_to_edge(self, edge_id):
+        topic_start_deployment = "model_ops/model_device/start_deployment/{}".format(str(edge_id))
+        logging.info("start_deployment: send topic " + topic_start_deployment + " to client...")
+        self.client_mqtt_mgr.send_message_json(topic_start_deployment, json.dumps(self.request_json))
+    
     def get_ip_address(self, request_json):
         # OPTION 1: Use local ip
         ip = ServerConstants.get_local_ip()
@@ -1007,7 +1069,7 @@ class FedMLServerRunner:
         # Start log processor for current run
         self.args.run_id = run_id
         self.args.edge_id = self.edge_id
-        MLOpsRuntimeLog.get_instance(self.args).init_logs(show_stdout_log=False)
+        MLOpsRuntimeLog.get_instance(self.args).init_logs(show_stdout_log=True)
         MLOpsRuntimeLogDaemon.get_instance(self.args).set_log_source(
             ServerConstants.FEDML_LOG_SOURCE_TYPE_MODEL_END_POINT)
         MLOpsRuntimeLogDaemon.get_instance(self.args).start_log_processor(run_id, self.edge_id)
@@ -1024,9 +1086,19 @@ class FedMLServerRunner:
         run_id_str = str(run_id)
         self.running_request_json[run_id_str] = request_json
 
-        diff_devices = self.get_diff_devices(run_id)
+        diff_devices, diff_version = self.get_diff_devices(run_id)
+        self.request_json["diff_devices"] = diff_devices
+        self.request_json["diff_version"] = diff_version
+
+        FedMLModelCache.get_instance().set_redis_params(self.redis_addr, self.redis_port, self.redis_password)
+
+        # Target status of the devices
+        FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
+            set_end_point_device_info(request_json["end_point_id"], end_point_name, json.dumps(device_objs))
+        
+        # Towards the target status, we might need to eplace the devices
         try:
-            self.handle_replaced_devices(diff_devices)
+            self.handle_update_devices(diff_devices)
         except Exception as e:
             run_id = self.request_json["run_id"]
             error_log_path = f"~/.fedml/fedml-model-server/fedml/logs/error_handle_{run_id}.txt"
@@ -1036,11 +1108,7 @@ class FedMLServerRunner:
                 f.write(str(e))
                 f.write('\n')
             raise e
-        request_json["diff_devices"] = diff_devices
 
-        FedMLModelCache.get_instance().set_redis_params(self.redis_addr, self.redis_port, self.redis_password)
-        FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
-            set_end_point_device_info(request_json["end_point_id"], end_point_name, json.dumps(device_objs))
         usr_indicated_token = self.get_usr_indicated_token(request_json)
         if usr_indicated_token != "":
             logging.info(f"Change Token from{token} to {usr_indicated_token}")
@@ -1099,17 +1167,21 @@ class FedMLServerRunner:
                                         ServerConstants.MODEL_DEPLOYMENT_STAGE3["text"],
                                         ServerConstants.MODEL_DEPLOYMENT_STAGE3["text"])
 
-    def get_diff_devices(self, run_id) -> dict:
-        # {device_id(int): "op: add" | "op: delete" | "op: replace"}
-        # "op: add" -> need to add 
-        # "op: delete" -> need to delete device
-        # "op: replace" -> need to restart the container of the device on same port with new model pkg
+    def get_diff_devices(self, run_id) -> (dict, dict):
+        '''
+        {device_id(int): "op: add" | "op: delete" | "op: replace"}
+        "op: add" -> need to add 
+        "op: delete" -> need to delete device
+        "op: replace" -> need to restart the container of the device on same port with new (same) model pkg
+
+        {device_id(int): "old_version"}   
+        '''
         try:
+            logging.info(f"Get diff devices for run {run_id}")
             request_json = self.running_request_json.get(str(run_id))
-            usr_in_worker_op = request_json["model_config"].get("worker_operation", 
-                                                            None)
             
             diff_devices = {}
+            diff_version = {}
             FedMLModelCache.get_instance().set_redis_params(self.redis_addr, self.redis_port, self.redis_password)
             device_objs = FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
                 get_end_point_device_info(run_id)
@@ -1118,23 +1190,29 @@ class FedMLServerRunner:
                     diff_devices[new_device_id] = ServerConstants.DEVICE_DIFF_ADD_OPERATION
             else:
                 device_objs_dict = json.loads(device_objs)
-                device_ids = [d["id"] for d in device_objs_dict]
+                device_ids_frm_db = [d["id"] for d in device_objs_dict]
 
-                for exist_device_id in device_ids:
+                logging.info(f"Debug Raphael 1-01-29 {device_ids_frm_db}")
+                logging.info(f"Debug Raphael 1-01-29 {request_json['device_ids']}")
+
+                for exist_device_id in device_ids_frm_db:
                     if exist_device_id not in request_json["device_ids"]:
                         diff_devices[exist_device_id] = ServerConstants.DEVICE_DIFF_DELETE_OPERATION
 
                 for new_device_id in request_json["device_ids"]:
-                    if new_device_id not in device_ids:
+                    if new_device_id not in device_ids_frm_db:
                         diff_devices[new_device_id] = ServerConstants.DEVICE_DIFF_ADD_OPERATION
                     else:
-                        # For an existed device
-                        if usr_in_worker_op == ServerConstants.USER_INPUT_WORKER_SCALE_OPERATION:
-                            diff_devices[new_device_id] = ServerConstants.DEVICE_DIFF_ADD_OPERATION
-                        elif usr_in_worker_op == ServerConstants.USER_INPUT_WORKER_UPATE_OPERATION:
+                        if new_device_id == self.edge_id:
+                            continue
+
+                        old_version = self.should_update_device(request_json, new_device_id)
+                        if old_version:
                             diff_devices[new_device_id] = ServerConstants.DEVICE_DIFF_REPLACE_OPERATION
+                            diff_version[new_device_id] = old_version
                         else:
                             pass
+            logging.info(f"Diff devices: {diff_devices}")
         except Exception as e:
             error_log_path = f"~/.fedml/fedml-model-server/fedml/logs/{run_id}_error.txt"
             if not os.path.exists(os.path.dirname(os.path.expanduser(error_log_path))):
@@ -1142,20 +1220,80 @@ class FedMLServerRunner:
             with open(os.path.expanduser(error_log_path), "w") as f:
                 f.write(str(e))
             raise e
-        return diff_devices
+        return diff_devices, diff_version
     
-    def handle_replaced_devices(self, diff_devices):
+    def should_update_device(self, payload, new_device_id):
         '''
-        Strategy-1: Delete the replaced device from the device list in local redis
+        Query the device info in local redis, if the device info is different from the payload, 
+        return the old model version
         '''
-        edge_id_list_to_delete = []
+        device_result_list = FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
+                        get_deployment_result_list(self.request_json["end_point_id"],
+                                                    self.request_json["end_point_name"],
+                                                    self.request_json["model_config"]["model_name"])
+        
+        for device_result in device_result_list:
+            if device_result is None:
+                continue
+            device_result_dict = json.loads(device_result)
+            
+            if int(device_result_dict["cache_device_id"]) == new_device_id:
+                result_body = json.loads(device_result_dict["result"])
+                if result_body["model_version"] != payload["model_config"]["model_version"]:
+                    return result_body["model_version"]
+                else:
+                    return None
+        return None
+
+    def handle_update_devices(self, diff_devices):
+        '''
+        Strategy 1: 
+        This function will only handle the devices to be update (not adding or deleting).
+        Currently, we support scroll update.
+
+        Send first scroll update message to the device(s), then callback will handle the rest
+        '''
+        edge_id_list_to_update = []
         for device_id in diff_devices:
             if diff_devices[device_id] == ServerConstants.DEVICE_DIFF_REPLACE_OPERATION:
-                edge_id_list_to_delete.append(device_id)
+                edge_id_list_to_update.append(device_id)
         
+        if len(edge_id_list_to_update) == 0:
+            return
+        
+        # Send first scroll update message to the device(s)
+        self.devices_need_update = edge_id_list_to_update.copy()
+        logging.info(f"Total update devices: {self.devices_need_update}")
+        self.send_first_scroll_update_msg(edge_id_list_to_update)
+         
+        # callback_deployment_result will handle the rest process
+
+    def send_first_scroll_update_msg(self, total_update_devices):
+        '''
+        Determin the first part of devices to send the first scroll update message,
+        Delete the record of the replaced device
+        Send the first scroll update message to the devices
+        '''
+        window_size = max(1, int(len(total_update_devices) * (1 - self.max_unavailable_rate)))
+        edges_in_window = total_update_devices[:window_size]
+        logging.info(f"Devices in window: {edges_in_window}")
+        
+        # Delete the record of the replaced device
+        self.delete_device_info_on_master(edges_in_window)
+
+        # Send the deploy msg to the devices, (we reuse the deploy msg)
+        for edge_id in edges_in_window:
+            if edge_id == self.edge_id:
+                continue
+            self.curr_update_window.append(edge_id)
+            # send start deployment request to each device
+            self.request_json["master_node_ip"] = self.get_ip_address(self.request_json)
+            self.send_deployment_start_request_to_edge(edge_id)    
+    
+    def delete_device_info_on_master(self, edge_id_list_to_delete):
         # Remove the record of the replaced device
         FedMLModelCache.get_instance().set_redis_params(self.redis_addr, self.redis_port, self.redis_password)
-        # 1. Get & Delete Deployment Status in Redis / SQLite
+        # 1.1 Get & Delete Deployment Status in Redis / SQLite
         devices_status_list = FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
             get_deployment_status_list(self.request_json["end_point_id"],
                                         self.request_json["end_point_name"],
@@ -1173,7 +1311,7 @@ class FedMLServerRunner:
                 self.request_json["model_config"]["model_name"]
             )
 
-        # 2. Get & Delete the endpoint device info in Redis / SQLite
+        # 1.2 Get & Delete the endpoint device info in Redis / SQLite
         device_objs = FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
             get_end_point_device_info(self.request_json["run_id"])
 
@@ -1189,7 +1327,7 @@ class FedMLServerRunner:
             self.request_json["end_point_id"], self.request_json["end_point_name"],
             json.dumps(total_device_objs_list))
 
-        # 3. Delete the result in deployment result list in Redis / SQLite
+        # 1.3 Delete the result in deployment result list in Redis / SQLite
         device_result_list = FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
             get_deployment_result_list(self.request_json["end_point_id"],
                                         self.request_json["end_point_name"],
@@ -1206,6 +1344,43 @@ class FedMLServerRunner:
                 self.request_json["end_point_name"],
                 self.request_json["model_config"]["model_name"]
             )
+        
+        logging.info(f"[Important!!] Delete the record of the replaced device {edge_id_list_to_delete} \
+                     {json.dumps(total_device_objs_list)}")
+
+    def send_next_scroll_update_msg(self, device_id: int):
+        logging.info(f"Received update msg from {device_id}, type: {type(device_id)}")
+        logging.info(f"Current update window: {self.curr_update_window}")
+        logging.info(f"Devices need to be updated: {self.devices_need_update}")
+        if (device_id not in self.devices_need_update) or (device_id not in self.curr_update_window):
+            # Prevent duplicate message / cross talk
+            logging.info(f"Device {device_id} is not in the update window nor need to be updated")
+            return  # TODO: Check if there is crosstalk use running_request_json
+        logging.info(f"Device {device_id} is in the update window")
+        self.devices_updated.append(device_id)
+        self.curr_update_window.remove(device_id)
+        logging.info(f"Current update window: {self.curr_update_window}")
+        if len(self.curr_update_window) == 0:
+            # trigger the next round of update
+            remain_devices = list(set(self.devices_need_update) - set(self.devices_updated))
+            logging.info(f"Devices need to be updated: {remain_devices}")
+            if len(remain_devices) == 0:
+                # All devices are updated
+                return
+            else:
+                window_size = max(1, int(len(remain_devices) * (1 - self.max_unavailable_rate)))
+                edges_in_window = remain_devices[:window_size]
+                logging.info(f"Devices in next round window: {edges_in_window}")
+                
+                # Delete the record of the replaced device
+                self.delete_device_info_on_master(edges_in_window)
+
+                # Send the deploy msg to the devices, (we reuse the deploy msg)
+                for edge_id in edges_in_window:
+                    if edge_id == self.edge_id:
+                        continue
+                    # send start deployment request to each device
+                    self.send_deployment_start_request_to_edge(edge_id)
 
     def callback_activate_deployment(self, topic, payload):
         logging.info("callback_activate_deployment: topic = %s, payload = %s" % (topic, payload))
