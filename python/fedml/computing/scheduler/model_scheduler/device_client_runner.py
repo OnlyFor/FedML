@@ -389,6 +389,7 @@ class FedMLClientRunner:
         self.check_runner_stop_event()
 
         # update local config with real time parameters from server and dynamically replace variables value
+        # TODO: Avoid overwrite the existed folder incase for rollback
         logging.info("download and unzip model to local...")
         unzip_package_path, model_bin_file, fedml_config_object = \
             self.update_local_fedml_config(run_id, model_config, model_config_parameters)
@@ -464,6 +465,53 @@ class FedMLClientRunner:
 
         if inference_output_url == "":
             logging.error("failed to deploy the model...")
+
+
+            if "diff_devices" in self.request_json and str(self.edge_id) in self.request_json["diff_devices"] and \
+                    self.request_json["diff_devices"][
+                        str(self.edge_id)] == ClientConstants.DEVICE_DIFF_REPLACE_OPERATION:
+                port_list = ClientConstants.rollback_deployment_containers(
+                    end_point_name, running_model_name, inference_model_version,
+                    inference_end_point_id, model_id, edge_id=self.edge_id)
+
+                # TODO: Support multiple ports
+                port = port_list[0]
+
+                if port is not None:
+                    # Update the port, sync to the master
+                    status_payload = self.construct_deployment_status(
+                        end_point_name, self.edge_id, model_id, model_name, old_model_version, inference_output_url,
+                        ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_DEPLOYED, inference_port=port)
+                    result_payload = self.construct_deployment_results(
+                        end_point_name, self.edge_id, ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_DEPLOYED,
+                        model_id, model_name, inference_output_url, old_model_version, port,
+                        inference_engine, model_metadata, model_config)
+
+                    FedMLModelDatabase.get_instance().set_deployment_result(
+                        run_id, end_point_name, model_name, old_model_version, self.edge_id, json.dumps(result_payload))
+
+                    FedMLModelDatabase.get_instance().set_deployment_status(
+                        run_id, end_point_name, model_name, old_model_version, self.edge_id, json.dumps(status_payload))
+
+                    # Send result
+                    result_payload = self.send_deployment_results(
+                        end_point_name, self.edge_id, ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_FAILED,
+                        model_id, model_name, inference_output_url, old_model_version, inference_port,
+                        inference_engine, model_metadata, model_config)
+
+                    # Send status
+                    self.mlops_metrics.run_id = self.run_id
+                    self.mlops_metrics.broadcast_client_training_status(
+                        self.edge_id, ClientConstants.MSG_MLOPS_CLIENT_STATUS_FAILED,
+                        is_from_model=True, run_id=self.run_id)
+
+                    # Sill boardcast finished status
+                    self.mlops_metrics.run_id = self.run_id
+                    self.mlops_metrics.broadcast_client_training_status(
+                        self.edge_id, ClientConstants.MSG_MLOPS_CLIENT_STATUS_FINISHED,
+                        is_from_model=True, run_id=self.run_id)
+
+                    return True  # Do not release GPU resource
 
             result_payload = self.send_deployment_results(
                 end_point_name, self.edge_id, ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_FAILED,
@@ -547,7 +595,8 @@ class FedMLClientRunner:
             FedMLModelDatabase.get_instance().delete_deployment_result_with_device_id(
                 end_point_id, end_point_name, model_name, self.edge_id)
 
-            ClientConstants.remove_deployment(
+            # Stop the old container
+            ClientConstants.stop_deployment_containers(
                 end_point_name, model_name, old_model_version,
                 end_point_id, model_id, edge_id=self.edge_id)
         except Exception as e:

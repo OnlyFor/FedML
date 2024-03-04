@@ -7,6 +7,9 @@ from docker import errors
 from fedml.computing.scheduler.comm_utils import sys_utils
 from fedml.core.common.singleton import Singleton
 from fedml.computing.scheduler.comm_utils.constants import SchedulerConstants
+from fedml.computing.scheduler.model_scheduler.device_client_constants import ClientConstants
+from fedml.computing.scheduler.comm_utils import security_utils
+
 import time
 
 
@@ -27,6 +30,27 @@ class ContainerUtils(Singleton):
             return None
 
         return client
+
+    @staticmethod
+    def get_deploy_container_name(end_point_name, model_name, model_version,
+                                  end_point_id, model_id, edge_id=None):
+        """
+        Return a list (Include replicate) of container names that are running the same model
+        """
+        running_model_name = ClientConstants.get_running_model_name(end_point_name, model_name, model_version,
+                                                                    end_point_id, model_id, edge_id=edge_id)
+        # Stop and delete the container
+        container_prefix = "{}".format(ClientConstants.FEDML_DEFAULT_SERVER_CONTAINER_NAME_PREFIX) + "__" + \
+                           security_utils.get_content_hash(running_model_name)
+
+        num_containers = ContainerUtils.get_container_rank_same_model(container_prefix)
+
+        container_name_list = []
+        for i in range(num_containers):
+            container_name = container_prefix + "__" + str(i)
+            container_name_list.append(container_name)
+
+        return container_name_list
 
     def get_docker_object(self, container_name):
         client = self.get_docker_client()

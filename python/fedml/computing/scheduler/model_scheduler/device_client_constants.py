@@ -17,6 +17,8 @@ import yaml
 
 import fedml
 import docker
+import requests
+import time
 
 from fedml.computing.scheduler.comm_utils import sys_utils
 from fedml.computing.scheduler.comm_utils.container_utils import ContainerUtils
@@ -339,7 +341,117 @@ class ClientConstants(object):
         return running_model_name
 
     @staticmethod
+    def stop_deployment_containers(end_point_name, model_name, model_version,
+                                   end_point_id=None, model_id=None, edge_id=None):
+        container_name_list = ContainerUtils.get_deploy_container_name(end_point_name, model_name, model_version,
+                                                                       end_point_id, model_id, edge_id=edge_id)
+        try:
+            client = docker.from_env()
+        except Exception:
+            logging.error("Failed to connect to the docker daemon, please ensure that you have "
+                          "installed Docker Desktop or Docker Engine, and the docker is running")
+            return False
+
+        for container_name in container_name_list:
+            try:
+                exist_container_obj = client.containers.get(container_name)
+            except docker.errors.NotFound:
+                logging.info("The container {} does not exist, cannot remove.".format(container_name))
+                exist_container_obj = None
+            except docker.errors.APIError:
+                logging.error("Failed to get the container object")
+                return False
+
+            if exist_container_obj is not None:
+                exist_container_obj.stop()
+                logging.info("Stopped and removed the container {}".format(container_name))
+
+        return True
+
+    @staticmethod
+    def remove_deployment_containers(end_point_name, model_name, model_version,
+                                     end_point_id=None, model_id=None, edge_id=None):
+        container_name_list = ContainerUtils.get_deploy_container_name(end_point_name, model_name, model_version,
+                                                                       end_point_id, model_id, edge_id=edge_id)
+        """
+        Remove the container and delete the old deployment folder
+        """
+        for container_name in container_name_list:
+            ContainerUtils.get_instance().remove_container(container_name)
+
+        # Delete the deployment
+        model_dir = os.path.join(ClientConstants.get_model_dir(), model_name,
+                                 ClientConstants.FEDML_CONVERTED_MODEL_DIR_NAME)
+        if os.path.exists(model_dir):
+            model_dir_list = os.listdir(model_dir)
+            for dir_item in model_dir_list:
+                if not dir_item.startswith(model_name):
+                    continue
+                logging.info("remove model file {}.".format(dir_item))
+                model_file_path = os.path.join(model_dir, dir_item)
+                shutil.rmtree(model_file_path, ignore_errors=True)
+                os.system("sudo rm -Rf {}".format(model_file_path))
+
+        # Delete the serving file
+        model_serving_dir = ClientConstants.get_model_serving_dir()
+        if not os.path.exists(model_serving_dir):
+            return False
+        serving_dir_list = os.listdir(model_serving_dir)
+        for dir_item in serving_dir_list:
+            if not dir_item.startswith(model_name):
+                continue
+            logging.info("remove model serving file {}.".format(dir_item))
+            model_file_path = os.path.join(model_serving_dir, dir_item)
+            shutil.rmtree(model_file_path, ignore_errors=True)
+            os.system("sudo rm -Rf {}".format(model_file_path))
+
+    @staticmethod
+    def rollback_deployment_containers(self, end_point_name, model_name, model_version, end_point_id=None,
+                                       model_id=None, edge_id=None, enable_health_probe=True, max_retry=60):
+        """
+        Start the container and report the new port.
+        """
+        container_name_list = ContainerUtils.get_deploy_container_name(end_point_name, model_name, model_version,
+                                                                       end_point_id, model_id, edge_id=edge_id)
+        port_list = []
+        for container_name in container_name_list:
+            _, port = ContainerUtils.get_instance().start_container(container_name)
+            if enable_health_probe:
+                curr_retry = 0
+                is_ready = False
+                while True:
+                    health_check_result = self.health_check(self, port=port)
+                    if health_check_result:
+                        is_ready = True
+                        break
+                    else:
+                        curr_retry += 1
+                        if curr_retry > max_retry:
+                            logging.error("Failed to start the container, the health check failed")
+                            break
+                        time.sleep(10)
+                if not is_ready:
+                    port = None
+            port_list.append(port)
+
+        return port_list
+
+    @staticmethod
+    def health_check(self, check_url="http://localhost", port=80, path="/ready"):
+        try:
+            response = requests.get(check_url + ":" + str(port) + path, timeout=9)
+            if response.status_code == 200:
+                return True
+            else:
+                return False
+        except Exception as e:
+            return False
+
+    @staticmethod
     def remove_deployment(end_point_name, model_name, model_version, end_point_id=None, model_id=None, edge_id=None):
+        """"
+        Stop and remove the container, delete the deployment folder
+        """
         running_model_name = ClientConstants.get_running_model_name(end_point_name, model_name, model_version,
                                                                     end_point_id, model_id, edge_id=edge_id)
         # Stop and delete the container

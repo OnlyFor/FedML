@@ -552,6 +552,8 @@ class FedMLServerRunner:
             set_deployment_result(end_point_id, end_point_name,
                                   model_name, model_version,
                                   device_id, payload)
+
+        # Set the deployment result in this class
         if self.slave_deployment_results_mapping.get(run_id_str, None) is None:
             self.slave_deployment_results_mapping[run_id_str] = dict()
         self.slave_deployment_results_mapping[run_id_str][str(device_id)] = model_status
@@ -582,7 +584,7 @@ class FedMLServerRunner:
 
         if request_json["diff_devices"].get(int(device_id), None) == ServerConstants.DEVICE_DIFF_REPLACE_OPERATION:
             if model_status == ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_FAILED:
-                # TODO: Support rollback
+                # This device will automatic Rollback, by start the container with old model
                 return
             else:
                 # Get record from the first message that Java mlops sent
@@ -766,6 +768,9 @@ class FedMLServerRunner:
 
             # Failed to deploy the model to all devices
             if failed_to_deploy_all_models:
+                # TODO: Check if it is the rollback operation
+
+
                 FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
                     set_end_point_activation(end_point_id, end_point_name, False)
                 FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
