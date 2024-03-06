@@ -156,7 +156,7 @@ class FedMLEndpointSyncProtocol(FedMLBaseProtocol):
         result_list = FedMLModelCache.get_instance().get_deployment_result_list(
             deployment_info.endpoint_id, deployment_info.endpoint_name, deployment_info.model_name)
         for result_item in result_list:
-            cache_device_id, result_payload = FedMLModelCache.get_instance().get_result_item_info(result_item)
+            cache_device_id, _, result_payload = FedMLModelCache.get_instance().get_result_item_info(result_item)
             if str(cache_device_id) == str(deployment_info.device_id):
                 result_item_found = result_item
                 result_payload_found = result_payload

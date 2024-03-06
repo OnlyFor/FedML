@@ -273,6 +273,8 @@ class JobMonitor(Singleton):
                             # Get model deployment result
                             deployment_result = FedMLModelDatabase.get_instance().get_deployment_result_with_device_id(
                                 job.job_id, endpoint_name, model_name, job.edge_id)
+
+                            # TODO: Check multiple replica health
                             if deployment_result is None:
                                 continue
 
@@ -572,7 +574,7 @@ class JobMonitor(Singleton):
         result_list = FedMLModelCache.get_instance().get_deployment_result_list(
             endpoint_id, endpoint_name, model_name)
         for result_item in result_list:
-            result_device_id, result_payload = FedMLModelCache.get_instance().get_result_item_info(
+            result_device_id, _, result_payload = FedMLModelCache.get_instance().get_result_item_info(
                 result_item)
 
             # Check if the endpoint is activated
