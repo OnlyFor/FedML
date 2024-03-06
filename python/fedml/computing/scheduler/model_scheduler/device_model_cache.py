@@ -221,13 +221,9 @@ class FedMLModelCache(Singleton):
             found_end_point_name = result_payload["end_point_name"]
             found_model_name = result_payload["model_name"]
             found_model_version = result_payload["model_version"]
-            logging.info(f"[Raphael] want to find {end_point_id}  got {found_end_point_id} same ? {found_end_point_id == end_point_id} \n"
-                            f" want to find {end_point_name}  got {found_end_point_name} same ? {found_end_point_name == end_point_name} \n"
-                            f" want to find {model_name}  got {found_model_name} same ? {found_model_name == model_name} \n"
-                            f" want to find {model_version}  got {found_model_version} same ? {found_model_version == model_version} \n")
 
             logging.info(result_payload["model_status"])
-            logging.info("end")
+
             if (str(found_end_point_id) == str(end_point_id) and found_end_point_name == end_point_name and
                     found_model_name == model_name and
                     (found_model_version == model_version or model_version == "*")):

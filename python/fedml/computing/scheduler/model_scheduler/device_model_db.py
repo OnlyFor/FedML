@@ -47,7 +47,9 @@ class FedMLModelDatabase(Singleton):
         result_list = self.get_deployment_results_info(end_point_id, end_point_name, model_name, model_version)
         ret_result_list = list()
         for result in result_list:
-            result_dict = {"cache_device_id": result.device_id, "result": result.deployment_result}
+            result_dict = {"cache_device_id": result.device_id,
+                           "cache_replica_no": result.replica_no,
+                           "result": result.deployment_result}
             ret_result_list.append(json.dumps(result_dict))
         return ret_result_list
 
@@ -61,6 +63,10 @@ class FedMLModelDatabase(Singleton):
         return ret_status_list
 
     def get_deployment_result_with_device_id(self, end_point_id, end_point_name, model_name, device_id):
+        """
+        Return a list of replica's result given end_point_id, end_point_name, model_name, device_id
+        """
+        replica_result_list = list()
         try:
             result_list = self.get_deployment_result_list(end_point_id, end_point_name, model_name)
             for result_item in result_list:
@@ -68,11 +74,13 @@ class FedMLModelDatabase(Singleton):
                 found_end_point_id = result_payload["end_point_id"]
 
                 if str(found_end_point_id) == str(end_point_id) and str(result_device_id) == str(device_id):
-                    return result_payload
+                    replica_result_list.append(result_payload)
         except Exception as e:
-            logging.info(e)
+            # Do not intervene other endpoints on this device
+            logging.error(f"Error in get_deployment_result_with_device_id: {e}")
+            return None
 
-        return None
+        return replica_result_list
 
     def get_deployment_status_with_device_id(self, end_point_id, end_point_name, model_name, device_id):
         try:

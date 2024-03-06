@@ -35,3 +35,7 @@ def get_api_key():
             return api_key
     except Exception as e:
         return ""
+
+
+if __name__ == '__main__':
+    save_api_key("b138682c73c64a22b11076201e34e590")
