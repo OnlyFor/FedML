@@ -67,7 +67,7 @@ class FedMLEndpointSyncProtocol(FedMLBaseProtocol):
 
     def send_sync_inference_info(
             self, master_id, worker_device_id, end_point_id, end_point_name, model_name,
-            model_id, model_version, inference_port, replica_no, disable=False, ):
+            model_id, model_version, inference_port, replica_no, disable=False):
         deployment_info_topic = f"{EndpointSyncMsgConstants.SLAVE_MASTER_DEPLOYMENT_INFO_MSG}/{master_id}"
         deployment_info_payload = {
             "device_id": worker_device_id, "end_point_id": end_point_id, "end_point_name": end_point_name,

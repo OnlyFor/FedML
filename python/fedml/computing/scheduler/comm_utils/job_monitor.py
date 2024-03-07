@@ -256,7 +256,8 @@ class JobMonitor(Singleton):
 
                             # Release the gpu ids
                             print(
-                                f"[endpoint/device][{job.job_id}/{job.edge_id}] Release gpu resource when woker endpoint failed on monitoring periodically.")
+                                f"[endpoint/device][{job.job_id}/{job.edge_id}] Release gpu resource when worker "
+                                f"endpoint failed on monitoring periodically.")
                             JobRunnerUtils.get_instance().release_gpu_ids(job.job_id, job.edge_id)
 
                     elif job.status == device_client_constants.ClientConstants.MSG_MLOPS_CLIENT_STATUS_FINISHED:
@@ -327,7 +328,7 @@ class JobMonitor(Singleton):
                                                                          MSG_MODELOPS_DEPLOYMENT_STATUS_UPDATING)
                                     endpoint_sync_protocol.set_local_deployment_status_result(
                                         job.job_id, endpoint_name, model_name, model_version, job.edge_id,
-                                        inference_port, None, deployment_result)
+                                        inference_port, None, deployment_result, replica_no=rank+1)
 
                             # Report the status to the master agent
                             if is_endpoint_ready:
@@ -446,7 +447,7 @@ class JobMonitor(Singleton):
 
     def _check_and_reset_endpoint_status(
             self, endpoint_id, device_id, deployment_result, only_check_inference_ready_status=False,
-            should_release_gpu_ids=True
+            should_release_gpu_ids=False
     ):
         result_json = deployment_result
         inference_url = result_json.get("model_url", None)
@@ -475,26 +476,23 @@ class JobMonitor(Singleton):
                 self.endpoint_unavailable_counter[str(endpoint_id)] = 0
                 return True
 
-            # Deprecated
-            # # If the endpoint unavailable counter is greater than the threshold value,
-            # # then release gpu ids and report failed status to the master agent.
-            # if self.endpoint_unavailable_counter.get(str(endpoint_id), 0) > \
-            #         SchedulerConstants.ENDPOINT_FAIL_THRESHOLD_VALUE:
-            #     if not self.released_endpoints.get(str(endpoint_id), False) and should_release_gpu_ids:
-            #         self.released_endpoints[str(endpoint_id)] = True
-            #
-            #         # Release the gpu ids
-            #         print(
-            #             f"[endpoint/device][{endpoint_id}/{device_id}] Release gpu resource "
-            #             f"when the worker endpoint is not ready on monitoring periodically.")
-            #         JobRunnerUtils.get_instance().release_gpu_ids(endpoint_id, device_id)
-            #
-            #     return False
+            # If the endpoint unavailable counter is greater than the threshold value,
+            # then try restarting the endpoint and release the gpu ids.
+            # If should_release_gpu_ids is True, then release the gpu ids.
+            if self.endpoint_unavailable_counter.get(str(endpoint_id), 0) > \
+                    SchedulerConstants.ENDPOINT_FAIL_THRESHOLD_VALUE:
+                if not self.released_endpoints.get(str(endpoint_id), False) and should_release_gpu_ids:
+                    self.released_endpoints[str(endpoint_id)] = True
+                    # Release the gpu ids
+                    print(
+                        f"[endpoint/device][{endpoint_id}/{device_id}] Release gpu resource "
+                        f"when the worker endpoint is not ready on monitoring periodically.")
+                    JobRunnerUtils.get_instance().release_gpu_ids(endpoint_id, device_id)
+
+                return False
             time.sleep(2)
 
-        return False
-
-    def is_inference_ready(self, inference_url, timeout=None, device_id=None, endpoint_id=None):
+    def is_inference_ready(self, inference_url, timeout=None, device_id=None, endpoint_id=None, use_mqtt=False):
         response_ok = asyncio.run(FedMLHttpInference.is_inference_ready(inference_url, timeout=timeout))
         if response_ok:
             print("Use http health check.")
@@ -513,6 +511,9 @@ class JobMonitor(Singleton):
             print("Use http proxy health check.")
             return response_ok
         print("Use http proxy health check failed.")
+
+        if not use_mqtt:
+            return False
 
         agent_config = dict()
         agent_config["mqtt_config"] = dict()

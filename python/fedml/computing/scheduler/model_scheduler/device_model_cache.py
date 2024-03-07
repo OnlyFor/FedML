@@ -273,6 +273,10 @@ class FedMLModelCache(Singleton):
                 device_id, _, result_payload = self.get_result_item_info(result_item)
                 found_end_point_id = result_payload["end_point_id"]
                 found_end_point_name = result_payload["end_point_name"]
+                found_model_status = result_payload["model_status"]
+
+                if found_model_status != "DEPLOYED":
+                    continue
 
                 if str(found_end_point_id) == str(idle_device_dict["end_point_id"]) \
                         and device_id == idle_device_dict["device_id"]:
