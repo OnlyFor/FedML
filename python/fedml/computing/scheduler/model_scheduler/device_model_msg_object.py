@@ -1,5 +1,5 @@
-
 import json
+import logging
 
 
 class FedMLModelMsgObject(object):
@@ -37,7 +37,10 @@ class FedMLModelMsgObject(object):
         }"""
 
         # get deployment params
-        request_json = json.loads(payload)
+        if isinstance(payload, dict):
+            request_json = payload
+        else:
+            request_json = json.loads(payload)
         self.msg_topic = topic
         self.request_json = request_json
         self.run_id = request_json["end_point_id"]
@@ -47,6 +50,8 @@ class FedMLModelMsgObject(object):
         self.user_name = request_json["user_name"]
         self.device_ids = request_json["device_ids"]
         self.device_objs = request_json["device_objs"]
+        self.gpu_topology = self.get_devices_avail_gpus()
+        self.gpu_per_replica = self.get_gpu_per_replica()
 
         self.model_config = request_json["model_config"]
         self.model_name = self.model_config["model_name"]
@@ -58,13 +63,30 @@ class FedMLModelMsgObject(object):
         self.inference_engine = self.model_config.get("inference_engine", 0)
         self.inference_end_point_id = self.run_id
 
-        self. request_json["run_id"] = self.run_id
+        self.request_json["run_id"] = self.run_id
+
+    def get_devices_avail_gpus(self):
+        # if "gpu_topology" not in self.request_json:
+        #     # TODO: raise error, now using default value
+        #     gpu_topology = {}
+        #     for id in self.request_json["device_ids"]:
+        #         if str(id) == str(self.master_id):
+        #             continue
+        #         gpu_topology[id] = 2
+        #     return gpu_topology
+        # return self.request_json["gpu_topology"]
+        # Temporary using self.request_json["parameters"]["gpu_topology"]
+        logging.info(f"[Replica Controller] [endpoint {self.run_id} ] devices_avail_gpus:"
+                     f" {self.request_json['parameters']['gpu_topology']}")
+        return self.request_json["parameters"]["gpu_topology"]
+
+    def get_gpu_per_replica(self):
+        """
+        Read gpu_per_replica from user's config yaml file. Default 1.
+        """
+        if "parameters" in self.request_json and "gpu_per_replica" in self.request_json["parameters"]:
+            return self.request_json["parameters"]["gpu_per_replica"]
+        return 1
 
     def show(self, prefix=""):
-        print("{}end point id: {}, model name: {}, model id: {},"
-              " model version: {}, model url: {}".format(prefix,
-                                                         self.inference_end_point_id,
-                                                         self.model_name,
-                                                         self.id,
-                                                         self.model_version,
-                                                         self.model_url))
+        logging.info(f"{prefix} [FedMLModelMsgObject] [run_id {self.run_id}] [end_point_name {self.end_point_name}]")

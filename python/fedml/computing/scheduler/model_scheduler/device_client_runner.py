@@ -53,6 +53,8 @@ from fedml.computing.scheduler.comm_utils.job_monitor import JobMonitor
 
 from .device_replica_handler import FedMLDeviceReplicaHandler
 
+from fedml.computing.scheduler.scheduler_core.endpoint_sync_protocol import FedMLEndpointSyncProtocol
+
 class RunnerError(Exception):
     """ Runner failed. """
     pass
@@ -418,10 +420,11 @@ class FedMLClientRunner:
         model_from_open = None
         self.model_is_from_open = None
 
-        logging.info("Check if need update / removing existed container...")
-        if "diff_devices" in self.request_json and str(self.edge_id) in self.request_json["diff_devices"] and \
-                self.request_json["diff_devices"][str(self.edge_id)] == ClientConstants.DEVICE_DIFF_REPLACE_OPERATION:
-            self.handle_replaced_device()
+        # logging.info("Check if need update / removing existed container...")
+        # if "diff_devices" in self.request_json and str(self.edge_id) in self.request_json["diff_devices"] and \
+        #         self.request_json["diff_devices"][str(self.edge_id)] == ClientConstants.DEVICE_DIFF_REPLACE_OPERATION:
+        #     # self.handle_replaced_device()
+        #     pass
 
         logging.info("start the model deployment...")
         self.check_runner_stop_event()
@@ -429,10 +432,11 @@ class FedMLClientRunner:
             "", "", model_version, {}, {}
 
         # Reconcile the replica number (op: add, remove)
-        op, op_num = self.replica_handler.reconcile_num_replica()
+        prev_rank, op, op_num = self.replica_handler.reconcile_num_replica()
         if op == "add":
             worker_ip = self.get_ip_address(self.request_json)
-            for rank in range(op_num):
+            for rank in range(prev_rank+1, prev_rank+1+op_num):
+                # TODO: Support Rollback if this for loop failed
                 try:
                     running_model_name, inference_output_url, inference_model_version, model_metadata, model_config = \
                         start_deployment(
@@ -495,7 +499,7 @@ class FedMLClientRunner:
                         run_id, end_point_name, model_name, model_version, self.edge_id,
                         json.dumps(result_payload), replica_no=rank + 1)
 
-                    logging.info(f"Deploy replica {rank+1} / {op_num} successfully.")
+                    logging.info(f"Deploy replica {rank+1} / {prev_rank+1+op_num} successfully.")
                     time.sleep(5)
             # end for
 
@@ -504,6 +508,31 @@ class FedMLClientRunner:
             self.mlops_metrics.broadcast_client_training_status(
                 self.edge_id, ClientConstants.MSG_MLOPS_CLIENT_STATUS_FINISHED,
                 is_from_model=True, run_id=self.run_id)
+            return True
+        elif op == "remove":
+            for rank_to_delete in range(prev_rank, prev_rank-op_num, -1):
+                self.replica_handler.remove_replica(rank_to_delete)
+
+                JobRunnerUtils.get_instance().release_partial_job_gpu()
+
+                FedMLModelDatabase.get_instance().delete_deployment_result_with_device_id_and_rank(
+                    run_id, end_point_name, model_name, self.edge_id, rank_to_delete)
+
+                # Report the deletion msg to master
+                result_payload = self.send_deployment_results(
+                    end_point_name, self.edge_id, ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_DELETED,
+                    model_id, model_name, inference_output_url, model_version, inference_port_external,
+                    inference_engine, model_metadata, model_config, replica_no=rank_to_delete + 1)
+
+                time.sleep(1)
+                self.mlops_metrics.run_id = self.run_id
+                self.mlops_metrics.broadcast_client_training_status(
+                    self.edge_id, ClientConstants.MSG_MLOPS_CLIENT_STATUS_FINISHED,
+                    is_from_model=True, run_id=self.run_id)
+
+                # TODO: If delete all replica, then delete the job and related resources
+                if rank_to_delete == 0:
+                    pass
             return True
 
         # end if

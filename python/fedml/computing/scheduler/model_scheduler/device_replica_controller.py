@@ -1,6 +1,8 @@
 import logging
 import copy
 from .device_model_cache import FedMLModelCache
+from .device_model_msg_object import FedMLModelMsgObject
+from .device_client_constants import ClientConstants
 
 
 class FedMLDeviceReplicaController:
@@ -18,74 +20,26 @@ class FedMLDeviceReplicaController:
         """
         self.master_id = master_id
         self.request_json = request_json
-        self.devices_avail_gpus = self.get_devices_avail_gpus_frm_request_json()
-        self.e_id = self.get_eid_frm_request_json()
+        self.request_msg_obj = FedMLModelMsgObject("replica_controller", request_json)
+
+        self.e_id = self.request_msg_obj.run_id
+        self.devices_avail_gpus = self.request_msg_obj.gpu_topology
         self.total_gpu_num = self.calc_total_gpu_num()
-        self.gpu_per_replica = self.get_gpu_per_replica_frm_request_json()
-        self.min_replica_num = self.get_min_replica_num_frm_request_json()
-        self.max_replica_num = self.get_max_replica_num_frm_request_json()
+        self.gpu_per_replica = self.request_msg_obj.gpu_per_replica
+        self.min_replica_num = self.request_msg_obj.scale_min
+        self.max_replica_num = self.request_msg_obj.scale_max
+        self.endpoint_name = self.request_msg_obj.end_point_name
+        self.model_name = self.request_msg_obj.model_name
+
         self.target_replica_num = self.init_id_replica_num()
         self.curr_replica_num = self.get_curr_replica_num_state_frm_db()
         self.intermediate_replica_num = copy.deepcopy(self.curr_replica_num)
-
-        self.endpoint_name = self.get_endpoint_name_frm_request_json()
-        self.model_name = self.get_model_name_frm_request_json()
-
-    def get_devices_avail_gpus_frm_request_json(self):
-        if "gpu_topology" not in self.request_json:
-            # TODO: raise error, now using default value
-            gpu_topology = {}
-            for id in self.request_json["device_ids"]:
-                if str(id) == str(self.master_id):
-                    continue
-                gpu_topology[id] = 2
-            return gpu_topology
-        return self.request_json["gpu_topology"]
-
-    def get_eid_frm_request_json(self):
-        if "end_point_id" not in self.request_json:
-            raise ValueError("end_point_id is not in request_json")
-        return self.request_json["end_point_id"]
-
-    def get_endpoint_name_frm_request_json(self):
-        if "end_point_name" not in self.request_json:
-            raise ValueError("end_point_name is not in request_json")
-        return self.request_json["end_point_name"]
-
-    def get_model_name_frm_request_json(self):
-        if "model_name" not in self.request_json["model_config"]:
-            raise ValueError("model_name is not in request_json")
-        return self.request_json["model_config"]["model_name"]
 
     def calc_total_gpu_num(self):
         total_gpu_num = 0
         for device_id, gpu_num in self.devices_avail_gpus.items():
             total_gpu_num += gpu_num
         return total_gpu_num
-
-    def get_gpu_per_replica_frm_request_json(self):
-        """
-        Read gpu_per_replica from user's config yaml file. Default 1.
-        """
-        if "gpu_per_replica" in self.request_json["parameters"]:
-            return self.request_json["parameters"]["gpu_per_replica"]
-        return 1
-
-    def get_min_replica_num_frm_request_json(self):
-        """
-        Read min_replica_num from mlops config yaml file. Default 0.
-        """
-        if "instance_scale_min" in self.request_json["model_config"]:
-            return self.request_json["model_config"]["instance_scale_min"]
-        return 0
-
-    def get_max_replica_num_frm_request_json(self):
-        """
-        Read min_replica_num from mlops config yaml file. Default the number of gpu available.
-        """
-        if "instance_scale_max" in self.request_json["model_config"]:
-            return self.request_json["model_config"]["instance_scale_max"]
-        return self.total_gpu_num
 
     def init_id_replica_num(self):
         """
@@ -160,26 +114,22 @@ class FedMLDeviceReplicaController:
     def get_curr_replica_num_state_frm_db(self):
         """
         Sync the current replica number state from the database.
-        [
-            # Replica 1
-            {'end_point_id': , 'end_point_name': '', 'model_id': , 'model_name':
-            '', 'model_url': '', 'model_version': ',
-            'port': , 'inference_engine': , 'model_metadata': {}, 'model_config': None, 'model_status': '',
-            'inference_port': , 'replica_no': , 'is_retain': },
-
-            ...
-        ]
+        Return the current replica number state.
         """
-        # TODO: Change to deployment result to support the continuous deployment
-        res_frm_db = FedMLModelCache.get_instance().get_endpoint_devices_replica_num(self.e_id)
+        res_frm_db = FedMLModelCache.get_instance().get_deployment_result_list(
+            self.e_id, self.endpoint_name, self.model_name)
 
-        if res_frm_db is None:
+        curr_state = {}
+        if res_frm_db is None or len(res_frm_db) == 0:
             # First time to get the replica number from the database
-            res_frm_db = {}
             for id, target_num in self.target_replica_num.items():
-                res_frm_db[str(id)] = 0
-
-        return res_frm_db
+                curr_state[str(id)] = 0
+        else:
+            for result_item in res_frm_db:
+                # Unpack the result_item
+                result_device_id, _, result_payload = FedMLModelCache.get_instance().get_result_item_info(result_item)
+                curr_state[str(result_device_id)] = curr_state.get(str(result_device_id), 0) + 1
+        return curr_state
 
     def generate_diff_to_request_json(self):
         """
@@ -187,7 +137,8 @@ class FedMLDeviceReplicaController:
         {
             "replica_num_diff": {
                 id1: {"op": "add", "curr_num": 1, "target_num": 2},
-                id2: {"op": "add", "curr_num": 1, "target_num": 2}
+                id2: {"op": "add", "curr_num": 1, "target_num": 2},
+                id3: {"op": "remove", "curr_num": 1, "target_num": 0}
             },
             "gpus_per_replica": 1,
         }
@@ -199,7 +150,7 @@ class FedMLDeviceReplicaController:
         self.request_json[gpu_per_replica_key] = self.gpu_per_replica
         return self.request_json
 
-    def callback_update_curr_replica_num_state(self, changed_device_id, replica_no):
+    def callback_update_curr_replica_num_state(self, changed_device_id, replica_no, op_type):
         """
         Callback function to update the current replica number.
         curr_state: {id1: 1, id2: 1}
@@ -208,13 +159,17 @@ class FedMLDeviceReplicaController:
         """
         if str(changed_device_id) not in self.intermediate_replica_num:
             raise ValueError(f"changed_device_id {changed_device_id} is not in intermediate_replica_num")
-        self.intermediate_replica_num[str(changed_device_id)] += 1
 
-    def is_all_replica_ready(self):
+        if op_type == ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_DEPLOYED:
+            self.intermediate_replica_num[str(changed_device_id)] += 1
+        elif op_type == ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_DELETED:
+            self.intermediate_replica_num[str(changed_device_id)] -= 1
+
+    def is_all_replica_target_state(self):
         """
-        Check if all the replicas are ready.
+        Check if all the replicas are ready. Including the number and version.
         """
         for id, replica_no in self.intermediate_replica_num.items():
-            if replica_no < self.target_replica_num[id]:
+            if replica_no != self.target_replica_num[id]:
                 return False
         return True

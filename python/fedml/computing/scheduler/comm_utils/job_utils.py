@@ -167,6 +167,10 @@ class JobRunnerUtils(Singleton):
         trimmed_gpu_ids = list(set(available_gpu_ids) - set(unavailable_gpu_ids))
         return trimmed_gpu_ids.copy()
 
+    def release_partial_job_gpu(self):
+        # TODO: In the deployment phase, if scale in, we need to release the gpu ids for the partial job.
+        pass
+
     def release_gpu_ids(self, run_id, device_id):
         edge_device_id = None
         original_run_id = None

@@ -134,9 +134,30 @@ class FedMLModelCache(Singleton):
         except Exception as e:
             pass
 
+    def delete_deployment_result_with_device_id_and_replica_no(self, end_point_id, end_point_name, model_name,
+                                                               device_id, replica_no_to_delete):
+        result_item_found = None
+
+        result_list = self.get_deployment_result_list(
+            end_point_id, end_point_name, model_name)
+
+        for result_item in result_list:
+            cache_device_id, cache_replica_no, result_payload = (
+                self.get_result_item_info(result_item))
+
+            if str(cache_device_id) == str(device_id) and cache_replica_no == replica_no_to_delete:
+                result_item_found = result_item
+                break
+
+        # Delete the replica element
+        if result_item_found is not None:
+            self.delete_deployment_result(
+                result_item_found, end_point_id, end_point_name, model_name)
+
     def get_deployment_result_list(self, end_point_id, end_point_name, model_name):
         try:
-            result_list = self.redis_connection.lrange(self.get_deployment_result_key(end_point_id, end_point_name, model_name), 0, -1)
+            result_list = self.redis_connection.lrange(
+                self.get_deployment_result_key(end_point_id, end_point_name, model_name), 0, -1)
         except Exception as e:
             logging.info(e)
             result_list = None

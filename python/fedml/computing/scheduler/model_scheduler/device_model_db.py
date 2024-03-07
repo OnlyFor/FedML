@@ -135,6 +135,18 @@ class FedMLModelDatabase(Singleton):
                  FedMLDeploymentResultInfoModel.device_id == f'{device_id}')).delete()
         self.db_connection.commit()
 
+    def delete_deployment_result_with_device_id_and_rank(self, end_point_id, end_point_name, model_name,
+                                                         device_id, replica_rank):
+        replica_no = replica_rank + 1
+        self.open_job_db()
+        self.db_connection.query(FedMLDeploymentResultInfoModel).filter(
+            and_(FedMLDeploymentResultInfoModel.end_point_id == f'{end_point_id}',
+                 FedMLDeploymentResultInfoModel.end_point_name == f'{end_point_name}',
+                 FedMLDeploymentResultInfoModel.model_name == f'{model_name}',
+                 FedMLDeploymentResultInfoModel.device_id == f'{device_id}',
+                 FedMLDeploymentResultInfoModel.replica_no == f'{replica_no}')).delete()
+        self.db_connection.commit()
+
     def delete_deployment_run_info(self, end_point_id):
         # db / table -> model-deployment.db / "deployment_run_info"
         self.open_job_db()

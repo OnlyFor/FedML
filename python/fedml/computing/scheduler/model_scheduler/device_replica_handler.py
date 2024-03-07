@@ -1,11 +1,15 @@
 import logging
 from ..scheduler_core.compute_cache_manager import ComputeCacheManager
+from ..comm_utils.container_utils import ContainerUtils
+from ..comm_utils import security_utils
+from .device_client_constants import ClientConstants
+from .device_model_msg_object import FedMLModelMsgObject
 
 
 class FedMLDeviceReplicaHandler:
     def __init__(self, worker_id, request_json: dict):
         """
-        Handler on the worker to acutally exec the reconcilation logic (Incluing add, remove, update).
+        Handler on the worker to actually exec the reconciliation logic (Including add, remove, update).
 
         e_id: unique id (i.e. endpoint_id) for each deployment
         devices_avail_gpus = {device_id1: gpu_num, device_id2: gpu_num, ...}
@@ -15,9 +19,15 @@ class FedMLDeviceReplicaHandler:
         """
         self.worker_id = worker_id
         self.request_json = request_json
-        self.e_id = self.get_eid_frm_request_json()
-        self.gpu_per_replica = self.get_gpu_per_replica_frm_request_json()
+        self.request_msg_obj = FedMLModelMsgObject("replica_handler", request_json)
+        self.e_id = self.request_msg_obj.run_id
+        self.gpu_per_replica = self.request_msg_obj.gpu_per_replica
         self.replica_num_diff = self.get_diff_replica_num_frm_request_json()
+
+        self.end_point_name = self.request_msg_obj.end_point_name
+        self.inference_model_name = self.request_msg_obj.model_name
+        self.model_version = self.request_msg_obj.model_version
+        self.model_id = self.request_msg_obj.model_id
 
         self.device_avail_gpus = self.get_device_avail_gpus_frm_db()
 
@@ -30,19 +40,6 @@ class FedMLDeviceReplicaHandler:
         logging.info(f"[Replica Handler] [endpoint {self.e_id} ] [worker {self.worker_id}] "
                      f"All device_avail_gpus: {available_gpu_ids}")
         return available_gpu_ids
-
-    def get_eid_frm_request_json(self):
-        if "end_point_id" not in self.request_json:
-            raise ValueError("end_point_id is not in request_json")
-        return self.request_json["end_point_id"]
-
-    def get_gpu_per_replica_frm_request_json(self):
-        """
-        Read gpu_per_replica from user's config yaml file. Default 1.
-        """
-        if "gpu_per_replica" in self.request_json["parameters"]:
-            return self.request_json["parameters"]["gpu_per_replica"]
-        return 1
 
     def get_diff_replica_num_frm_request_json(self):
         """
@@ -70,10 +67,27 @@ class FedMLDeviceReplicaHandler:
         if self.replica_num_diff["op"] not in ["add", "remove"]:
             raise ValueError(f"op should be add or remove. Got {self.replica_num_diff['op']}")
 
+        prev_rank = self.replica_num_diff["curr_num"] - 1
         if self.replica_num_diff["op"] == "add":
+            assert self.replica_num_diff["target_num"] > self.replica_num_diff["curr_num"]
             op, op_num = (self.replica_num_diff["op"],
                           self.replica_num_diff["target_num"] - self.replica_num_diff["curr_num"])
         else:
+            assert self.replica_num_diff["target_num"] < self.replica_num_diff["curr_num"]
             op, op_num = (self.replica_num_diff["op"],
                           self.replica_num_diff["curr_num"] - self.replica_num_diff["target_num"])
-        return op, op_num
+        return prev_rank, op, op_num
+
+    def remove_replica(self, rank):
+        """
+        Remove replica_num replicas from device_id.
+        """
+        running_model_name = ClientConstants.get_running_model_name(
+            self.end_point_name, self.inference_model_name, self.model_version, self.e_id, self.model_id,
+            self.worker_id)
+        container_prefix = ("{}".format(ClientConstants.FEDML_DEFAULT_SERVER_CONTAINER_NAME_PREFIX) + "__" +
+                            security_utils.get_content_hash(running_model_name))
+        container_name = container_prefix + "__" + str(rank)
+        logging.info(f"[Replica Handler] [Remove Replica] [Device {self.worker_id}] [Endpoint {self.e_id}]"
+                     f" [Replica {rank}] [Container {container_name}]")
+        ContainerUtils.get_instance().remove_container(container_name)
