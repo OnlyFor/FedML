@@ -84,7 +84,7 @@ def start_deployment(end_point_id, end_point_name, model_id, model_version,
                      inference_use_gpu, inference_memory_size,
                      inference_convertor_image, inference_server_image,
                      infer_host, model_is_from_open, model_params,
-                     model_from_open, token, master_ip, edge_id, master_device_id=None):
+                     model_from_open, token, master_ip, edge_id, master_device_id=None, replica_rank=0):
     logging.info("Model deployment is starting...")
 
     sudo_prefix = "sudo "
@@ -240,12 +240,7 @@ def start_deployment(end_point_id, end_point_name, model_id, model_version,
     container_prefix = ("{}".format(ClientConstants.FEDML_DEFAULT_SERVER_CONTAINER_NAME_PREFIX) + "__" +
                         security_utils.get_content_hash(running_model_name))
 
-    # Resolve the same model container rank
-    same_model_container_rank = ContainerUtils.get_container_rank_same_model(container_prefix)
-    if same_model_container_rank == -1:
-        logging.error(f"Fail to get existed docker with {end_point_name} {inference_model_name}")
-        raise Exception("Failed to get the container rank")
-    default_server_container_name = container_prefix + "__" + str(same_model_container_rank)
+    default_server_container_name = container_prefix + "__" + str(replica_rank)
 
     try:
         exist_container_obj = client.containers.get(default_server_container_name)

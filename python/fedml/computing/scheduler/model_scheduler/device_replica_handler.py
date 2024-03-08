@@ -22,7 +22,9 @@ class FedMLDeviceReplicaHandler:
         self.request_msg_obj = FedMLModelMsgObject("replica_handler", request_json)
         self.e_id = self.request_msg_obj.run_id
         self.gpu_per_replica = self.request_msg_obj.gpu_per_replica
+
         self.replica_num_diff = self.get_diff_replica_num_frm_request_json()
+        self.replica_version_diff = self.get_diff_replica_version_frm_request_json()
 
         self.end_point_name = self.request_msg_obj.end_point_name
         self.inference_model_name = self.request_msg_obj.model_name
@@ -54,6 +56,27 @@ class FedMLDeviceReplicaHandler:
             return self.request_json["replica_num_diff"][str(self.worker_id)]
         return None
 
+    def get_diff_replica_version_frm_request_json(self):
+        """
+        Read replica_diff passing by master's request json.
+        Return:
+        {
+            "id1": {
+                $replica_no: {"op": "update", "new_version": "v2", "old_version": "v1"},
+                $replica_no: {"op": "update", "new_version": "v2", "old_version": "v1"}
+             },
+            "id2": {
+                $replica_no: {"op": "update", "new_version": "v2", "old_version": "v1"},
+                $replica_no: {"op": "update", "new_version": "v2", "old_version": "v1"}
+            }
+        }
+        """
+        if ("replica_version_diff" in self.request_json and
+                str(self.worker_id) in self.request_json["replica_version_diff"]):
+            return self.request_json["replica_version_diff"][str(self.worker_id)]
+
+        return None
+
     def reconcile_num_replica(self):
         """
         To solve the conflict between different reconciliation requests. The request & delete reqs should be
@@ -62,7 +85,8 @@ class FedMLDeviceReplicaHandler:
         return (op, number of op)
         """
         if not self.replica_num_diff:
-            raise ValueError(f"replica_num_diff is empty, cannot reconcile.")
+            logging.info(f"replica_num_diff is empty, will not reconcile.")
+            return None, None, None
 
         if self.replica_num_diff["op"] not in ["add", "remove"]:
             raise ValueError(f"op should be add or remove. Got {self.replica_num_diff['op']}")
@@ -91,3 +115,24 @@ class FedMLDeviceReplicaHandler:
         logging.info(f"[Replica Handler] [Remove Replica] [Device {self.worker_id}] [Endpoint {self.e_id}]"
                      f" [Replica {rank}] [Container {container_name}]")
         ContainerUtils.get_instance().remove_container(container_name)
+
+    def reconcile_replica_version(self):
+        """
+        Return a list of replica_rank to be updated.
+        Giving {
+                $replica_no: {"op": "update", "new_version": "v2", "old_version": "v1"},
+                $replica_no: {"op": "update", "new_version": "v2", "old_version": "v1"}
+             }
+        for all replicas, update the version. i.e. stop and  remove the container, records in db, then start the new
+        container, and report when the new container is ready.
+        """
+        replica_rank_to_update = []
+        ret_op = "update"
+        if not self.replica_version_diff:
+            logging.info(f"replica_version_diff is empty, will not reconcile.")
+            return None, None
+
+        for replica_no, diff in self.replica_version_diff.items():
+            replica_rank_to_update.append(int(replica_no)-1)
+
+        return replica_rank_to_update, ret_op

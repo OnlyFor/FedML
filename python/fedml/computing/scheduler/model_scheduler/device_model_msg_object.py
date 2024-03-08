@@ -50,8 +50,6 @@ class FedMLModelMsgObject(object):
         self.user_name = request_json["user_name"]
         self.device_ids = request_json["device_ids"]
         self.device_objs = request_json["device_objs"]
-        self.gpu_topology = self.get_devices_avail_gpus()
-        self.gpu_per_replica = self.get_gpu_per_replica()
 
         self.model_config = request_json["model_config"]
         self.model_name = self.model_config["model_name"]
@@ -65,6 +63,11 @@ class FedMLModelMsgObject(object):
 
         self.request_json["run_id"] = self.run_id
 
+        self.gpu_topology = self.get_devices_avail_gpus()
+        self.gpu_per_replica = self.get_gpu_per_replica()
+
+        self.max_unavailable_rate = self.model_config.get("max_unavailable_rate", 0.1)
+
     def get_devices_avail_gpus(self):
         # if "gpu_topology" not in self.request_json:
         #     # TODO: raise error, now using default value
@@ -76,9 +79,21 @@ class FedMLModelMsgObject(object):
         #     return gpu_topology
         # return self.request_json["gpu_topology"]
         # Temporary using self.request_json["parameters"]["gpu_topology"]
-        logging.info(f"[Replica Controller] [endpoint {self.run_id} ] devices_avail_gpus:"
-                     f" {self.request_json['parameters']['gpu_topology']}")
-        return self.request_json["parameters"]["gpu_topology"]
+
+        res = {}
+        # [Test1] using self.request_json["parameters"]["gpu_topology"]
+        # logging.info(f"[Replica Controller] [endpoint {self.run_id} ] devices_avail_gpus:"
+        #              f" {self.request_json['parameters']['gpu_topology']}")
+        # res = self.request_json["parameters"]["gpu_topology"]
+
+        # [Test2] Using self.scale_min
+        for id in self.request_json["device_ids"]:
+            if str(id) == str(self.device_ids[0]):
+                continue
+            res[id] = int(self.scale_min)
+
+        # [Prod] Using self.request_json["gpu_topology"]
+        return res
 
     def get_gpu_per_replica(self):
         """

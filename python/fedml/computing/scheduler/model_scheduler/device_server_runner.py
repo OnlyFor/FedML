@@ -353,13 +353,10 @@ class FedMLServerRunner:
         self.check_runner_stop_event()
 
         # handle "op:add" && "op:remove"
-        devices_recv_msg = self.send_deployment_start_request_to_edges()
+        devices_sent_add_or_remove_msg = self.send_deployment_start_request_to_edges()
 
         # handle "op:update"
-        # TODO: Handle "op:update" in replica manner
-        # first_chunk_devices_update = self.request_json.get("first_chunk_devices_update", list())
-        # if len(first_chunk_devices_update) > 0:
-        #     self.send_first_scroll_update_msg(first_chunk_devices_update)
+        self.send_first_scroll_update_msg()
 
         while True:
             self.check_runner_stop_event()
@@ -529,7 +526,7 @@ class FedMLServerRunner:
         model_name = payload_json["model_name"]
         model_version = payload_json["model_version"]
         model_status = payload_json["model_status"]
-        replica_no = payload_json.get("replica_no", 1)  # Idx start from 1
+        replica_no = payload_json.get("replica_no", None)  # Idx start from 1
         run_id_str = str(end_point_id)
 
         # Set redis + sqlite deployment result
@@ -552,9 +549,11 @@ class FedMLServerRunner:
             assert model_status == ClientConstants.MSG_MODELOPS_DEPLOYMENT_STATUS_FAILED
 
         # Notify the replica number controller
-        # TODO: Consider the update operation, which will not change the replica number
         (self.model_runner_mapping[run_id_str].
          replica_controller.callback_update_curr_replica_num_state(device_id, replica_no, model_status))
+
+        # Notify the replica version controller, which might trigger the next rolling update
+        self.send_next_scroll_update_msg(device_id, replica_no)
 
         # Update the global deployment result mapping
         if self.slave_deployment_results_mapping.get(run_id_str, None) is None:
@@ -610,7 +609,8 @@ class FedMLServerRunner:
         #         self.send_next_scroll_update_msg(int(device_id))
 
         # Wait for all replica's result, not device-level
-        if self.model_runner_mapping[run_id_str].replica_controller.is_all_replica_target_state():
+        if (self.model_runner_mapping[run_id_str].replica_controller.is_all_replica_num_reconciled() and
+                self.model_runner_mapping[run_id_str].replica_controller.is_all_replica_version_reconciled()):
             '''
             When all the devices have finished the add / delete / update operation
             '''
@@ -687,6 +687,9 @@ class FedMLServerRunner:
 
     def send_deployment_start_request_to_edges(self):
         # Iterate through replica_num_diff, both add and replace should be sent to the edge devices
+        if "replica_num_diff" not in self.request_json or self.request_json["replica_num_diff"] is None:
+            return []
+
         edge_id_list = []
         for device_id in self.request_json["replica_num_diff"].keys():
             edge_id_list.append(device_id)
@@ -1002,9 +1005,16 @@ class FedMLServerRunner:
             # Replica Controller is per deployment!
             replica_controller = FedMLDeviceReplicaController(self.edge_id, self.request_json)
             logging.info(f"Start Diff Replica controller for run {run_id} on edge {self.edge_id}")
-            new_request_with_diff = replica_controller.generate_diff_to_request_json()
-            self.running_request_json[run_id_str] = new_request_with_diff
-            request_json = new_request_with_diff
+
+            # Prepare num diff
+            new_request_with_num_diff = replica_controller.generate_diff_to_request_json()
+            self.running_request_json[run_id_str] = new_request_with_num_diff
+            request_json = new_request_with_num_diff
+
+            # Prepare version diff
+            new_request_with_version_diff = replica_controller.init_first_update_device_replica_mapping()
+            self.running_request_json[run_id_str] = new_request_with_version_diff
+            request_json = new_request_with_version_diff
 
             server_runner = FedMLServerRunner(
                 self.args, run_id=run_id, request_json=request_json, agent_config=self.agent_config
@@ -1024,6 +1034,8 @@ class FedMLServerRunner:
             self.run_process_completed_event_map[run_id_str].clear()
             server_runner.run_process_completed_event = self.run_process_completed_event_map[run_id_str]
             self.model_runner_mapping[run_id_str] = server_runner
+
+            # This subprocess will copy the server_runner and run it, but they are not the same object
             server_process = Process(target=server_runner.run, args=(
                 self.run_process_event_map[run_id_str], self.run_process_completed_event_map[run_id_str]
             ))
@@ -1113,101 +1125,44 @@ class FedMLServerRunner:
         return None
 
     def init_device_update_map(self):
+        # [Deprecated] Use the replica controller to manage the device update
+        pass
+
+    def send_first_scroll_update_msg(self):
         """
-        Scroll update.
-        Set the schema request json, which, will trans to subprocess (device_server_runner).
-        The subprocess will send the init deployment msg to the worker device(s),
-            then, the callback_deployment_result will handle the rest updating msg.
-        """
-        self.slave_update_result_mapping[self.run_id] = {
-            "devices_need_update": [],
-            "total_updated_devices": [],
-            "curr_update_window": [],
-            "max_unavailable_rate": 0.1
-        }
-
-        for device_id, device_op in self.request_json["diff_devices"].items():
-            if device_op == ServerConstants.DEVICE_DIFF_REPLACE_OPERATION:
-                self.slave_update_result_mapping[self.run_id]["devices_need_update"].append(device_id)
-
-        total_num = len(self.slave_update_result_mapping[self.run_id]["devices_need_update"])
-
-        if total_num == 0:
-            return
-
-        max_unavailable_rate = self.request_json["parameters"].get("max_unavailable_rate", 0.1)
-
-        window_size = max(1, int(total_num * max_unavailable_rate))
-
-        first_chunk_devices_update = \
-            self.slave_update_result_mapping[self.run_id]["devices_need_update"][:window_size].copy()
-
-        self.slave_update_result_mapping[self.run_id]["curr_update_window"] = first_chunk_devices_update
-
-        self.request_json["first_chunk_devices_update"] = first_chunk_devices_update.copy()    # to Notify sub-process
-
-    def send_first_scroll_update_msg(self, first_chunk_devices_update):
-        """
+        Replica-level rolling update.
         Delete the record of the replaced device and send the deployment msg to the devices
         """
-        if len(first_chunk_devices_update) == 0:
+        if "replica_version_diff" not in self.request_json or self.request_json["replica_version_diff"] is None:
             return
 
+        first_chunk_dict = self.request_json["replica_version_diff"]
+
         # Delete the record of the replaced device
-        self.delete_device_info_on_master(first_chunk_devices_update)
+        self.delete_device_replica_info_on_master(first_chunk_dict)
 
         # Send the deployment msg to the devices, (we reuse the start_deployment msg)
-        for edge_id in first_chunk_devices_update:
+        for edge_id in first_chunk_dict.keys():
             if edge_id == self.edge_id:
                 continue
             # send start deployment request to each device
             self.send_deployment_start_request_to_edge(edge_id)
         return
     
-    def delete_device_info_on_master(self, edge_id_list_to_delete):
-        # Remove the record of the replaced device
+    def delete_device_replica_info_on_master(self, edge_id_replica_no_dict):
         FedMLModelCache.get_instance().set_redis_params(self.redis_addr, self.redis_port, self.redis_password)
-        # 1.1 Get & Delete Deployment Status in Redis / SQLite
-        devices_status_list = FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
-            get_deployment_status_list(self.request_json["end_point_id"], self.request_json["end_point_name"],
-                                       self.request_json["model_config"]["model_name"])
-        delete_devices_status_list = []
-        for device_status in devices_status_list:
-            device_status_dict = json.loads(device_status)
-            if int(device_status_dict["cache_device_id"]) in edge_id_list_to_delete:
-                delete_devices_status_list.append(device_status)
-        
-        for delete_item in delete_devices_status_list:
-            FedMLModelCache.get_instance(self.redis_addr, self.redis_port).delete_deployment_status(
-                delete_item, self.request_json["end_point_id"],
-                self.request_json["end_point_name"],
-                self.request_json["model_config"]["model_name"]
-            )
-
-        # 1.2 Get & Delete the endpoint device info in Redis / SQLite
-        device_objs = FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
-            get_end_point_device_info(self.request_json["run_id"])
-
-        if device_objs is None:
-            return
-        
-        total_device_objs_list = json.loads(device_objs)
-        for device_obj in total_device_objs_list:
-            if device_obj["id"] in edge_id_list_to_delete:
-                total_device_objs_list.remove(device_obj)
-        
-        FedMLModelCache.get_instance(self.redis_addr, self.redis_port).set_end_point_device_info(
-            self.request_json["end_point_id"], self.request_json["end_point_name"],
-            json.dumps(total_device_objs_list))
-
-        # 1.3 Delete the result in deployment result list in Redis / SQLite
+        # Remove the record of the replaced device
+        # [Deprecated] deployment status & device info
+        # Delete the result in deployment result list in Redis / SQLite
         device_result_list = FedMLModelCache.get_instance(self.redis_addr, self.redis_port). \
             get_deployment_result_list(self.request_json["end_point_id"], self.request_json["end_point_name"],
                                        self.request_json["model_config"]["model_name"])
         delete_device_result_list = []
         for device_result in device_result_list:
             device_result_dict = json.loads(device_result)
-            if int(device_result_dict["cache_device_id"]) in edge_id_list_to_delete:
+            if (str(device_result_dict["cache_device_id"]) in edge_id_replica_no_dict.keys() and
+                    str(device_result_dict["cache_replica_no"]) in
+                    edge_id_replica_no_dict[str(device_result_dict["cache_device_id"])]):
                 delete_device_result_list.append(device_result)
         
         for delete_item in delete_device_result_list:
@@ -1217,48 +1172,35 @@ class FedMLServerRunner:
                 self.request_json["model_config"]["model_name"]
             )
         
-        logging.info(f"Deleted the record of the replaced device {edge_id_list_to_delete}")
+        logging.info(f"Deleted the record of the replaced device {delete_device_result_list}")
 
-    def send_next_scroll_update_msg(self, device_id: int):
-        this_run_meta_data = self.slave_update_result_mapping[self.run_id]
-
-        devices_need_update = this_run_meta_data["devices_need_update"]
-        devices_updated = this_run_meta_data["total_updated_devices"]
-        curr_update_window = this_run_meta_data["curr_update_window"]
-        max_unavailable_rate = this_run_meta_data["max_unavailable_rate"]
-
-        if (device_id not in devices_need_update) or (device_id in devices_updated):
-            # Prevent duplicate message / cross talk
-            # TODO: Check the cross talk if multiple run update the same device
-            logging.info(f"Device {device_id} is not in the update window nor need to be updated")
+    def send_next_scroll_update_msg(self, device_id, replica_no):
+        if replica_no is None:
             return
 
-        devices_updated.append(device_id)
-        curr_update_window.remove(device_id)
+        replica_controller = self.model_runner_mapping[str(self.run_id)].replica_controller
 
-        logging.info(f"Current update window {curr_update_window} after deleting: Device {device_id}")
+        if replica_controller.total_replica_version_diff_num == 0:
+            return
 
-        if len(curr_update_window) == 0:
-            remain_devices = list(set(devices_need_update) - set(devices_updated))
-            logging.info(f"Devices need to be updated: {remain_devices}")
-            if len(remain_devices) == 0:    # All devices are updated
-                return
-            else:
-                window_size = max(1, int(len(remain_devices) * max_unavailable_rate))
-                edges_in_window = remain_devices[:window_size]
-                logging.info(f"Devices in next round window: {edges_in_window}")
-                curr_update_window = edges_in_window.copy()     # Slide the window
-                self.slave_update_result_mapping[self.run_id]["curr_update_window"] = edges_in_window.copy()
+        replica_controller.callback_update_updating_window(device_id, replica_no)
 
-                self.delete_device_info_on_master(edges_in_window)
+        # Decide whether to send the next scroll update
+        next_chunk_dict = replica_controller.get_next_chunk_devices_replica()
 
-                # Send the deployment msg to the devices, (we reuse the deployment msg)
-                for edge_id in edges_in_window:
-                    if edge_id == self.edge_id:
-                        continue
-                    self.send_deployment_start_request_to_edge(edge_id)
-        else:
-            pass    # Wait for the callback of other devices in this window
+        replica_controller.curr_replica_updating_window = copy.deepcopy(next_chunk_dict)
+
+        if next_chunk_dict:
+            self.request_json["replica_version_diff"] = next_chunk_dict
+            self.delete_device_replica_info_on_master(next_chunk_dict)
+
+            # Send the deployment msg to the devices, (we reuse the start_deployment msg)
+            for edge_id in next_chunk_dict.keys():
+                if edge_id == self.edge_id:
+                    continue
+                # send start deployment request to each device
+                self.send_deployment_start_request_to_edge(edge_id)
+        return
 
     def callback_activate_deployment(self, topic, payload):
         logging.info("callback_activate_deployment: topic = %s, payload = %s" % (topic, payload))

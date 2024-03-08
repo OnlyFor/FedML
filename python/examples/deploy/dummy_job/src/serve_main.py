@@ -9,7 +9,7 @@ class DummyPredictor(FedMLPredictor):
         self.worker_id = uuid.uuid4()
         
     def predict(self, request):
-        return {f"AlohaV1From{self.worker_id}": request}
+        return {f"AlohaV2From{self.worker_id}": request}
 
 
 if __name__ == "__main__":
